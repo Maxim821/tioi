@@ -1,0 +1,271 @@
+import argparse
+import base64
+import binascii
+from concurrent.futures import ThreadPoolExecutor
+import logging
+import mimetypes
+import re
+from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+
+import requests
+from bs4 import BeautifulSoup, Tag
+from openpyxl import Workbook
+from PIL import Image
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+BASE_URL = "https://transparencia.gob.es"
+CATALOG_URL = f"{BASE_URL}/publicidad-activa/por-materias/altos-cargos/curriculos"
+PROFILE_URL = f"{BASE_URL}/servicios-buscador/contenido/curriculums.htm"
+FIELDS = [
+    "ID",
+    "URL",
+    "Título",
+    "Ministerio",
+    "Cargo",
+    "Funciones",
+    "Formación académica",
+    "Experiencia profesional",
+    "Reseña personal",
+]
+ONCLICK_RE = re.compile(
+    r"onClickPostContenido\s*\(\s*(['\"])(.*?)\1\s*,\s*"
+    r"(['\"])(.*?)\3\s*,\s*(['\"])(.*?)\5\s*,\s*(['\"])(.*?)\7",
+    re.IGNORECASE,
+)
+
+
+def make_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=1,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST"}),
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (compatible; TransparenciaCurriculosParser/1.0)",
+            "Accept-Language": "es-ES,es;q=0.9",
+        }
+    )
+    return session
+
+
+def get_soup(session: requests.Session, url: str, **kwargs) -> BeautifulSoup:
+    response = session.get(url, timeout=30, **kwargs)
+    response.raise_for_status()
+    return BeautifulSoup(response.content, "html.parser")
+
+
+def text_of(node: Tag | None) -> str:
+    if node is None:
+        return ""
+    return " ".join(node.get_text(" ", strip=True).split())
+
+
+def catalog_search_urls(soup: BeautifulSoup) -> list[str]:
+    urls = []
+    for link in soup.select(".card-container .dnt-card a.cmp-title__link"):
+        href = link.get("href")
+        if href and "buscar.htm" in href:
+            urls.append(urljoin(BASE_URL, href))
+    return list(dict.fromkeys(urls))
+
+
+def page_links(soup: BeautifulSoup) -> list[str]:
+    links = []
+    for link in soup.select("article p.textRight a[href*='pag=']"):
+        href = link.get("href")
+        if href:
+            links.append(urljoin(BASE_URL, href))
+    return list(dict.fromkeys(links))
+
+
+def parse_profile_link(link: Tag, page_url: str) -> dict | None:
+    onclick = link.get("onclick", "")
+    match = ONCLICK_RE.search(onclick)
+    if not match:
+        # Some site versions expose the data as query parameters instead.
+        href = link.get("href", "")
+        query = parse_qs(urlparse(href).query)
+        if not query.get("id"):
+            return None
+        return {
+            "url": urljoin(BASE_URL, href),
+            "id": query["id"][0],
+            "lang": query.get("lang", ["es"])[0],
+            "fcAct": query.get("fcAct", [""])[0],
+        }
+    content_path, profile_id, lang, fc_act = match.group(2), match.group(4), match.group(6), match.group(8)
+    profile_url = f"{PROFILE_URL}?{urlencode({'id': profile_id, 'lang': lang, 'fcAct': fc_act})}"
+    return {"url": profile_url, "id": profile_id, "lang": lang, "fcAct": fc_act}
+
+
+def collect_rows_from_search(session: requests.Session, start_url: str) -> list[dict]:
+    queue = [start_url]
+    visited = set()
+    rows = []
+    while queue:
+        url = queue.pop(0)
+        if url in visited:
+            continue
+        visited.add(url)
+        try:
+            soup = get_soup(session, url)
+        except requests.RequestException as exc:
+            logging.error("Не удалось загрузить страницу списка %s: %s", url, exc)
+            continue
+        table = soup.select_one("#tablaNormal table#resultados")
+        if table is None:
+            logging.warning("На странице списка не найдена таблица: %s", url)
+        else:
+            for tr in table.select(":scope > tbody > tr"):
+                title_cell = tr.select_one("td[data-columna='titulo']")
+                if title_cell is None:
+                    logging.warning("Пропущена строка без столбца Título на %s", url)
+                    continue
+                link = title_cell.select_one("a")
+                profile = parse_profile_link(link, url) if link else None
+                if profile is None:
+                    logging.error("Не удалось определить ссылку профиля на %s", url)
+                    continue
+                profile.update(
+                    {
+                        "Título": text_of(title_cell),
+                        "Ministerio": text_of(tr.select_one("td[data-columna='ministerio']")),
+                        "Cargo": text_of(tr.select_one("td[data-columna='cargo']")),
+                    }
+                )
+                rows.append(profile)
+        queue.extend(link for link in page_links(soup) if link not in visited)
+    return rows
+
+
+def extract_section(soup: BeautifulSoup, title: str) -> str:
+    heading = next(
+        (tag for tag in soup.select("article h1, article h2, article h3, article h4, article h5, article h6")
+         if text_of(tag).casefold() == title.casefold()),
+        None,
+    )
+    if heading is None:
+        return ""
+    parts = []
+    for sibling in heading.next_siblings:
+        if isinstance(sibling, Tag) and sibling.name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            break
+        if isinstance(sibling, Tag):
+            value = text_of(sibling)
+            if value:
+                parts.append(value)
+        elif str(sibling).strip():
+            parts.append(str(sibling).strip())
+    return " ".join(parts).strip()
+
+
+def download_photo(session: requests.Session, src: str, destination: Path) -> None:
+    if src.startswith("data:"):
+        header, encoded = src.split(",", 1)
+        if ";base64" not in header:
+            raise ValueError("изображение data URI не содержит base64")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("некорректные данные base64") from exc
+    else:
+        response = session.get(urljoin(BASE_URL, src), timeout=30)
+        response.raise_for_status()
+        data = response.content
+    destination.write_bytes(data)
+    try:
+        with Image.open(destination) as image:
+            image.convert("RGB").save(destination, format="JPEG", quality=95)
+    except Exception as exc:
+        logging.warning("Фото сохранено без преобразования JPEG (%s): %s", destination, exc)
+
+
+def parse_profile(session: requests.Session, row: dict, photo_path: Path) -> None:
+    try:
+        # GET is the public equivalent of the site's JavaScript POST request
+        # and avoids hanging connections on this endpoint.
+        response = session.get(row["url"], headers={"Referer": CATALOG_URL}, timeout=(10, 30))
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, "html.parser")
+        for field in ("Funciones", "Formación académica", "Experiencia profesional", "Reseña personal"):
+            row[field] = extract_section(soup, field)
+        image = soup.select_one("img.curriculum")
+        if image and image.get("src"):
+            download_photo(session, image["src"], photo_path)
+        else:
+            logging.warning("Фото отсутствует в профиле %s", row["id"])
+    except (requests.RequestException, ValueError, OSError) as exc:
+        logging.error("Ошибка обработки профиля %s (%s): %s", row.get("id", "?"), row.get("Título", ""), exc)
+
+
+def save_excel(rows: list[dict], output: Path) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Currículos"
+    sheet.append(FIELDS)
+    for row in rows:
+        sheet.append([row.get(field, "") for field in FIELDS])
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    widths = [8, 55, 35, 40, 40, 60, 60, 60, 60]
+    for index, width in enumerate(widths, 1):
+        sheet.column_dimensions[chr(64 + index)].width = width
+    workbook.save(output)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Сбор CV высокопоставленных должностных лиц Portal de Transparencia")
+    parser.add_argument("--output", default="curriculos.xlsx", help="Имя Excel-файла")
+    parser.add_argument("--photos", default="photos", help="Папка для фотографий")
+    parser.add_argument("--workers", type=int, default=8, help="Число одновременных запросов профилей")
+    args = parser.parse_args()
+    output = Path(args.output)
+    photos = Path(args.photos)
+    photos.mkdir(parents=True, exist_ok=True)
+    session = make_session()
+    try:
+        catalog = get_soup(session, CATALOG_URL)
+    except requests.RequestException as exc:
+        logging.error("Не удалось загрузить каталог: %s", exc)
+        return
+    search_urls = catalog_search_urls(catalog)
+    if not search_urls:
+        logging.error("В каталоге не найдены ссылки на страницы с результатами")
+        return
+    discovered = []
+    seen_profiles = set()
+    for search_url in search_urls:
+        for row in collect_rows_from_search(session, search_url):
+            key = (row["id"], row["fcAct"])
+            if key not in seen_profiles:
+                seen_profiles.add(key)
+                discovered.append(row)
+    logging.info("Найдено уникальных профилей: %d", len(discovered))
+    for person_id, row in enumerate(discovered, 1):
+        row["ID"] = person_id
+
+    def process(item: tuple[int, dict]) -> None:
+        person_id, row = item
+        logging.info("Обработка %d/%d: %s", person_id, len(discovered), row["Título"])
+        # Separate sessions avoid sharing requests.Session between threads.
+        parse_profile(make_session(), row, photos / f"{person_id}.jpg")
+
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
+        list(executor.map(process, enumerate(discovered, 1)))
+    save_excel(discovered, output)
+    logging.info("Excel-файл сохранён: %s", output.resolve())
+    logging.info("Фотографии сохранены в: %s", photos.resolve())
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    main()
